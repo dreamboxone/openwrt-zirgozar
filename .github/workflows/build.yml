@@ -1,0 +1,162 @@
+name: Build OpenWrt + Zirgozar for Google WiFi
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: Optional stable OpenWrt version
+        type: string
+      zirgozar_tag:
+        description: Optional Zirgozar release tag
+        type: string
+      force_build:
+        description: Rebuild an existing version pair
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: google-wifi-firmware
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
+      openwrt_tag: ${{ steps.versions.outputs.openwrt_tag }}
+      zirgozar_tag: ${{ steps.versions.outputs.zirgozar_tag }}
+      release_tag: ${{ steps.versions.outputs.release_tag }}
+      should_build: ${{ steps.versions.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check upstream stable releases
+        id: versions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_OPENWRT_VERSION: ${{ inputs.openwrt_version }}
+          INPUT_ZIRGOZAR_TAG: ${{ inputs.zirgozar_tag }}
+          INPUT_FORCE_BUILD: ${{ inputs.force_build }}
+        run: python3 scripts/check_updates.py
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      OPENWRT_VERSION: ${{ needs.check.outputs.openwrt_version }}
+      OPENWRT_TAG: ${{ needs.check.outputs.openwrt_tag }}
+      ZIRGOZAR_TAG: ${{ needs.check.outputs.zirgozar_tag }}
+      RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools python3-distutils rsync swig unzip zlib1g-dev \
+            file wget ccache libelf-dev jq curl
+      - name: Clone selected upstream releases
+        run: |
+          git clone --depth 1 --branch "$OPENWRT_TAG" https://github.com/openwrt/openwrt.git openwrt
+          git clone --depth 1 --branch "$ZIRGOZAR_TAG" https://github.com/dreamboxone/zirgozar.git upstream-zirgozar
+          mkdir -p artifacts
+          printf 'OpenWrt %s %s\nZirgozar %s %s\n' \
+            "$OPENWRT_TAG" "$(git -C openwrt rev-parse HEAD)" \
+            "$ZIRGOZAR_TAG" "$(git -C upstream-zirgozar rev-parse HEAD)" > artifacts/sources.txt
+      - name: Prepare Zirgozar and bundled cores
+        run: |
+          set -euo pipefail
+          sh upstream-zirgozar/build/build-core.sh arm_cortex-a7_neon-vfpv4
+          cp -a upstream-zirgozar/package/zirgozar openwrt/package/
+          cp -a upstream-zirgozar/package/luci-app-zirgozar openwrt/package/
+          cp -a upstream-zirgozar/prebuilt openwrt/
+          mkdir -p openwrt/files/usr/share/licenses/zirgozar openwrt/files/etc/zirgozar
+          cp upstream-zirgozar/LICENSE openwrt/files/usr/share/licenses/zirgozar/LICENSE
+          cp upstream-zirgozar/prebuilt/arm_cortex-a7_neon-vfpv4/xray-version.txt openwrt/files/etc/zirgozar/xray-version
+          cp upstream-zirgozar/prebuilt/arm_cortex-a7_neon-vfpv4/sing-box-version.txt openwrt/files/etc/zirgozar/sing-box-version
+          sha256sum upstream-zirgozar/prebuilt/arm_cortex-a7_neon-vfpv4/{xray,sing-box} >> artifacts/sources.txt
+          cp -a overlay/. openwrt/files/
+          chmod +x openwrt/files/etc/uci-defaults/zzz-zirgozar
+      - name: Install standard feeds
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            ./scripts/feeds update -a && break
+            test "$attempt" -lt 3 || exit 1
+            sleep 20
+          done
+          ./scripts/feeds install -a
+      - name: Configure device and verify required packages
+        working-directory: openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/config/google_wifi-zirgozar.config" .config
+          make defconfig
+          for symbol in TARGET_ipq40xx_chromium_DEVICE_google_wifi PACKAGE_zirgozar PACKAGE_luci-app-zirgozar PACKAGE_mwan3 PACKAGE_luci-app-mwan3; do
+            grep -qx "CONFIG_${symbol}=y" .config
+          done
+          if grep -Eq '^CONFIG_PACKAGE_luci-app-passwall2?=y$' .config; then exit 1; fi
+      - name: Download and compile firmware
+        working-directory: openwrt
+        run: |
+          make download -j8
+          make -j"$(nproc)" V=s || make -j1 V=s
+      - name: Validate and collect images
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          target=bin/targets/ipq40xx/chromium
+          manifest="$target/openwrt-${OPENWRT_VERSION}-ipq40xx-chromium-google_wifi.manifest"
+          test -s "$manifest"
+          for package in zirgozar luci-app-zirgozar mwan3 luci-app-mwan3 kmod-nft-tproxy kmod-nft-socket; do
+            grep -q "^${package} -" "$manifest"
+          done
+          prefix="openwrt-google-wifi-ac1304-${OPENWRT_VERSION}-zirgozar-${ZIRGOZAR_TAG}"
+          for kind in factory sysupgrade; do
+            image="$target/openwrt-${OPENWRT_VERSION}-ipq40xx-chromium-google_wifi-squashfs-${kind}.bin"
+            test -s "$image"
+            cp "$image" "../artifacts/${prefix}-${kind}.bin"
+          done
+          cp "$manifest" ../artifacts/
+          cp .config ../artifacts/build.config
+          cd ../artifacts
+          sha256sum *.bin > sha256sums
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.RELEASE_TAG }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish firmware release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: OpenWrt ${{ env.OPENWRT_VERSION }} + Zirgozar ${{ env.ZIRGOZAR_TAG }} (Google WiFi AC-1304)
+          make_latest: true
+          fail_on_unmatched_files: true
+          body: |
+            فریمور Google WiFi AC-1304 (Gale)، همراه زیرگذر و mwan3.
+            OpenWrt: ${{ env.OPENWRT_VERSION }}
+            Zirgozar: ${{ env.ZIRGOZAR_TAG }}
+            target: ipq40xx/chromium
+
+            factory.bin برای نصب اولیه و sysupgrade.bin برای ارتقای OpenWrt است.
+            پیش از نصب از تنظیمات نسخهٔ پشتیبان بگیرید.
+            هش فایل‌ها در sha256sums و نسخهٔ سورس‌ها در sources.txt قرار دارد.
+            سورس زیرگذر: https://github.com/dreamboxone/zirgozar/tree/${{ env.ZIRGOZAR_TAG }}
+          files: artifacts/*

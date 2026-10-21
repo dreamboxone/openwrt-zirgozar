@@ -1,0 +1,15 @@
+#!/bin/sh
+# Initialize the services whose package postinst skips image creation.
+mkdir -p /etc/zirgozar/geo /var/run/zirgozar /etc/crontabs
+touch /etc/crontabs/root
+sed -i '\|/usr/libexec/zgz-|d' /etc/crontabs/root
+echo '*/15 * * * * /usr/libexec/zgz-refresh >/dev/null 2>&1' >> /etc/crontabs/root
+echo '*/5 * * * * /usr/libexec/zgz-stats sample >/dev/null 2>&1' >> /etc/crontabs/root
+for service in zirgozar zirgozar-led zirgozar-server zirgozar-killswitch; do
+    /etc/init.d/"$service" enable
+done
+/usr/libexec/zgz-router rebind >/dev/null 2>&1 || true
+/usr/libexec/zgz-router schedule sync >/dev/null 2>&1 || true
+/etc/init.d/cron restart
+/etc/init.d/rpcd restart
+exit 0
