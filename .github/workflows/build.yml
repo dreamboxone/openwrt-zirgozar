@@ -115,25 +115,7 @@ jobs:
           make download -j8
           make -j"$(nproc)" V=s || make -j1 V=s
       - name: Validate and collect images
-        working-directory: openwrt
-        run: |
-          set -euo pipefail
-          target=bin/targets/ipq40xx/chromium
-          manifest="$target/openwrt-${OPENWRT_VERSION}-ipq40xx-chromium-google_wifi.manifest"
-          test -s "$manifest"
-          for package in zirgozar luci-app-zirgozar mwan3 luci-app-mwan3 kmod-nft-tproxy kmod-nft-socket; do
-            grep -q "^${package} -" "$manifest"
-          done
-          prefix="openwrt-google-wifi-ac1304-${OPENWRT_VERSION}-zirgozar-${ZIRGOZAR_TAG}"
-          for kind in factory sysupgrade; do
-            image="$target/openwrt-${OPENWRT_VERSION}-ipq40xx-chromium-google_wifi-squashfs-${kind}.bin"
-            test -s "$image"
-            cp "$image" "../artifacts/${prefix}-${kind}.bin"
-          done
-          cp "$manifest" ../artifacts/
-          cp .config ../artifacts/build.config
-          cd ../artifacts
-          sha256sum *.bin > sha256sums
+        run: python3 scripts/collect_images.py
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
