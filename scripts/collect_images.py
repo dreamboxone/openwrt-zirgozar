@@ -8,8 +8,9 @@ import shutil
 
 
 REQUIRED_PACKAGES = {
-    "zirgozar", "luci-app-zirgozar", "mwan3", "luci-app-mwan3",
+    "zirgozar", "mwan3", "luci-app-mwan3",
     "kmod-nft-tproxy", "kmod-nft-socket",
+    "dnsmasq-full",
 }
 
 

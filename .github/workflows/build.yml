@@ -81,6 +81,7 @@ jobs:
           set -euo pipefail
           sh upstream-zirgozar/build/build-core.sh arm_cortex-a7_neon-vfpv4
           cp -a upstream-zirgozar/package/zirgozar openwrt/package/
+          # The unified package still reads interface sources from this sibling directory.
           cp -a upstream-zirgozar/package/luci-app-zirgozar openwrt/package/
           cp -a upstream-zirgozar/prebuilt openwrt/
           mkdir -p openwrt/files/usr/share/licenses/zirgozar openwrt/files/etc/zirgozar
@@ -105,15 +106,35 @@ jobs:
         run: |
           cp "$GITHUB_WORKSPACE/config/google_wifi-zirgozar.config" .config
           make defconfig
-          for symbol in TARGET_ipq40xx_chromium_DEVICE_google_wifi PACKAGE_zirgozar PACKAGE_luci-app-zirgozar PACKAGE_mwan3 PACKAGE_luci-app-mwan3; do
+          for symbol in TARGET_ipq40xx_chromium_DEVICE_google_wifi PACKAGE_zirgozar PACKAGE_mwan3 PACKAGE_luci-app-mwan3 PACKAGE_dnsmasq-full; do
             grep -qx "CONFIG_${symbol}=y" .config
           done
           if grep -Eq '^CONFIG_PACKAGE_luci-app-passwall2?=y$' .config; then exit 1; fi
+          if grep -qx 'CONFIG_PACKAGE_dnsmasq=y' .config; then exit 1; fi
       - name: Download and compile firmware
         working-directory: openwrt
         run: |
-          make download -j8
-          make -j"$(nproc)" V=s || make -j1 V=s
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+          make download -j8 > "$GITHUB_WORKSPACE/build-logs/download.log" 2>&1 || {
+            tail -n 200 "$GITHUB_WORKSPACE/build-logs/download.log"
+            exit 1
+          }
+          if ! make -j"$(nproc)" V=s > "$GITHUB_WORKSPACE/build-logs/compile.log" 2>&1; then
+            tail -n 100 "$GITHUB_WORKSPACE/build-logs/compile.log"
+            make -j1 V=s > "$GITHUB_WORKSPACE/build-logs/compile-retry.log" 2>&1 || {
+              tail -n 200 "$GITHUB_WORKSPACE/build-logs/compile-retry.log"
+              exit 1
+            }
+          fi
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.RELEASE_TAG }}
+          path: build-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Validate and collect images
         run: python3 scripts/collect_images.py
       - name: Upload build artifacts
